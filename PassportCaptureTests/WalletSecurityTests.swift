@@ -1,0 +1,222 @@
+import XCTest
+@testable import PassportCapture
+
+final class WalletSecurityTests: XCTestCase {
+    func testRegistrationAcceptsOnlyBoundTestActivationAndLegacyPending() throws {
+        let id = String(repeating: "a", count: 64)
+        var result: [String: Any] = ["checksPassed": true, "issuanceEnabled": false,
+            "credential": ["id": id, "state": "ACTIVE"], "testBetaEndsAt": 1796079600]
+        XCTAssertEqual(try CredentialState.registrationResult(result, credentialID: id, publicBeta: true), .active)
+        XCTAssertThrowsError(try CredentialState.registrationResult(result, credentialID: id, publicBeta: false))
+        XCTAssertThrowsError(try CredentialState.registrationResult(result, credentialID: String(repeating: "b", count: 64), publicBeta: true))
+        for (field, value) in [("checksPassed", false as Any), ("issuanceEnabled", true as Any), ("testBetaEndsAt", 1796079601 as Any)] {
+            var changed = result; changed[field] = value
+            XCTAssertThrowsError(try CredentialState.registrationResult(changed, credentialID: id, publicBeta: true))
+        }
+        result.removeValue(forKey: "testBetaEndsAt")
+        XCTAssertThrowsError(try CredentialState.registrationResult(result, credentialID: id, publicBeta: true))
+        result["credential"] = ["id": id, "state": "PENDING_REVIEW"]
+        XCTAssertEqual(try CredentialState.registrationResult(result, credentialID: id, publicBeta: false), .pending)
+        for state in ["REVOKED", "EXPIRED", "unexpected"] {
+            result["credential"] = ["id": id, "state": state]
+            XCTAssertThrowsError(try CredentialState.registrationResult(result, credentialID: id, publicBeta: true))
+        }
+    }
+    @MainActor func testRefreshFailureDoesNotClaimAnActionWasSent() {
+        let message = WalletModel.failureMessage(action: "snapshot", error: URLError(.notConnectedToInternet))
+        XCTAssertTrue(message.contains("Hämta status"))
+        XCTAssertFalse(message.contains("ditt val"))
+        XCTAssertTrue(WalletModel.failureMessage(action: "approve", error: URLError(.timedOut)).contains("innan du försöker igen"))
+    }
+    @MainActor func testCancelledAuthenticationIsNotAnErrorAlert() {
+        XCTAssertTrue(WalletModel.wasCancelled(CancellationError()))
+        XCTAssertTrue(WalletModel.wasCancelled(WalletError.cancelled))
+        XCTAssertFalse(WalletModel.wasCancelled(URLError(.timedOut)))
+    }
+    let ident = String(repeating: "a", count: 64)
+    let requestID = String(repeating: "b", count: 64)
+    let now: TimeInterval = 1000
+    var config: ServerConfiguration { try! ServerConfiguration(origin: "https://192.168.1.20:8765", pairing: String(repeating: "x", count: 43)) }
+    var request: WalletRequest { WalletRequest(id: requestID, relyingParty: "openID lokal testtjänst", purpose: "Logga in", code: "123456", expiresAt: 1100) }
+    func envelope(_ changes: [String: Any] = [:]) -> DeviceChallenge {
+        var data: [String: Any] = ["version":1,"origin":config.origin,"credentialId":ident,"action":"approve",
+            "requestId":requestID,"challengeId":"challenge","expiresAt":1060,
+            "relyingParty":request.relyingParty,"purpose":request.purpose,"code":request.code]
+        data.merge(changes, uniquingKeysWith: { _, value in value })
+        let encoded = try! JSONSerialization.data(withJSONObject: data)
+        return DeviceChallenge(id: "challenge", signingInput: encoded.base64EncodedString())
+    }
+    func testExactDisplayedApprovalCanBeSigned() throws {
+        let challenge = envelope()
+        XCTAssertEqual(try challenge.validatedBytes(configuration: config, credentialID: ident, action: "approve", request: request, now: now), Data(base64Encoded: challenge.signingInput))
+    }
+    func testChangedRelyingPartyPurposeAndCodeCannotBeSigned() {
+        for field in ["relyingParty", "purpose", "code"] {
+            XCTAssertThrowsError(try envelope([field:"attacker"]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: request, now: now))
+        }
+    }
+    func testWrongOriginCredentialActionSessionAndRequestCannotBeSigned() {
+        for field in ["origin", "credentialId", "action", "challengeId", "requestId"] {
+            XCTAssertThrowsError(try envelope([field:"other"]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: request, now: now))
+        }
+    }
+    func testExpiredAndExcessivelyLongChallengeCannotBeSigned() {
+        for expiry in [999, 1000, 1091] {
+            XCTAssertThrowsError(try envelope(["expiresAt":expiry]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: request, now: now))
+        }
+    }
+    var signing: WalletRequest { WalletRequest(id: requestID, relyingParty: "openID kontotjänst", purpose: "Skriv under och dela namn", code: "123456", expiresAt: 1100,
+        signMessage: "Jag skriver under ”Avtal om provtjänst”, dokument OID-123456.\nKontrollsumma: 0123abcd") }
+    func signingEnvelope(_ changes: [String: Any] = [:]) -> DeviceChallenge {
+        let base: [String: Any] = ["action": "sign", "relyingParty": signing.relyingParty, "purpose": signing.purpose, "signMessage": signing.signMessage!]
+        return envelope(base.merging(changes) { _, value in value })
+    }
+    func testSignatureNeedsSeparateActionAndExactText() throws {
+        XCTAssertNoThrow(try signingEnvelope().validatedBytes(configuration: config, credentialID: ident, action: "sign", request: signing, now: now))
+        XCTAssertThrowsError(try signingEnvelope(["signMessage": "Jag skriver under något annat"]).validatedBytes(configuration: config, credentialID: ident, action: "sign", request: signing, now: now))
+        XCTAssertThrowsError(try signingEnvelope(["signMessage": NSNull()]).validatedBytes(configuration: config, credentialID: ident, action: "sign", request: signing, now: now))
+        // A signature request cannot be approved as a login, and a login cannot be signed.
+        XCTAssertThrowsError(try signingEnvelope(["action": "approve"]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: signing, now: now))
+        XCTAssertThrowsError(try envelope(["action": "sign"]).validatedBytes(configuration: config, credentialID: ident, action: "sign", request: request, now: now))
+        // An old-style login envelope with smuggled text is rejected.
+        XCTAssertThrowsError(try envelope(["signMessage": "dold text"]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: request, now: now))
+        XCTAssertNoThrow(try signingEnvelope(["action": "reject"]).validatedBytes(configuration: config, credentialID: ident, action: "reject", request: signing, now: now))
+    }
+    func testSignMessageIsBoundedPlainText() {
+        XCTAssertTrue(WalletRequest.validSignMessage(signing.signMessage!))
+        for text in ["", " padded", String(repeating: "x", count: 401), "a\u{07}b", "a\u{202E}b", "a\u{2066}b", "a\rb"] {
+            XCTAssertFalse(WalletRequest.validSignMessage(text), text)
+        }
+    }
+    func testSecurityCodeLevelIsPartOfTheSignedConsent() {
+        let high = WalletRequest(id: requestID, relyingParty: request.relyingParty, purpose: request.purpose, code: request.code, expiresAt: 1100, verification: "pin")
+        XCTAssertNoThrow(try envelope(["verification": "pin"]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: high, now: now))
+        XCTAssertThrowsError(try envelope().validatedBytes(configuration: config, credentialID: ident, action: "approve", request: high, now: now))
+        XCTAssertThrowsError(try envelope(["verification": "pin"]).validatedBytes(configuration: config, credentialID: ident, action: "approve", request: request, now: now))
+    }
+    @MainActor func testWeakAndMalformedSecurityCodesAreRefusedLocally() {
+        for code in ["000000", "123456", "654321", "121212", "123123", "112112", "12345", "abcdef", "４８２９１７"] {
+            XCTAssertTrue(SecurityCode.weak(code), code)
+        }
+        XCTAssertFalse(SecurityCode.weak("482917"))
+        XCTAssertTrue(WalletError.securityCode("PIN_INCORRECT", 2).localizedDescription.contains("2 försök kvar"))
+        XCTAssertTrue(WalletModel.failureMessage(action: "approve", error: WalletError.securityCode("PIN_LOCKED", 0)).contains("spärrad"))
+    }
+    func testExpiredDisplayedRequestCannotBeSigned() {
+        let expired = WalletRequest(id: requestID, relyingParty: request.relyingParty, purpose: request.purpose, code: request.code, expiresAt: 1000)
+        XCTAssertThrowsError(try envelope().validatedBytes(configuration: config, credentialID: ident, action: "approve", request: expired, now: now))
+    }
+    func testSnapshotCannotSmuggleApproval() {
+        XCTAssertThrowsError(try envelope().validatedBytes(configuration: config, credentialID: ident, action: "snapshot", request: nil, now: now))
+    }
+    func testInspectCanReadRequestButCannotSignApproval() throws {
+        let challenge = envelope(["action":"inspect", "relyingParty":NSNull(), "purpose":NSNull(), "code":NSNull()])
+        XCTAssertNoThrow(try challenge.validatedBytes(configuration:config,credentialID:ident,action:"inspect",request:nil,inspectID:requestID,now:now))
+        XCTAssertThrowsError(try challenge.validatedBytes(configuration:config,credentialID:ident,action:"approve",request:request,now:now))
+        XCTAssertThrowsError(try challenge.validatedBytes(configuration:config,credentialID:ident,action:"inspect",request:nil,inspectID:String(repeating:"c",count:64),now:now))
+        XCTAssertThrowsError(try envelope().validatedBytes(configuration:config,credentialID:ident,action:"inspect",request:nil,inspectID:requestID,now:now))
+    }
+    func testIdentityProfilePreservesMrzAndRejectsOversizedOrMalformedPortrait() throws {
+        let image = Data([0xff,0xd8,0xff,0xd9]).base64EncodedString()
+        let identity = PassportIdentity(displayName:"ALICE SYNTHETIC",birthDateMrz:"900101",portraitJpeg:image)
+        XCTAssertNoThrow(try identity.validate())
+        XCTAssertEqual(identity.birthDateMrz,"900101")
+        for invalid in [PassportIdentity(displayName:"<script>",birthDateMrz:"900101",portraitJpeg:image),
+                        PassportIdentity(displayName:"ALICE",birthDateMrz:"19900101",portraitJpeg:image),
+                        PassportIdentity(displayName:"ALICE",birthDateMrz:"900101",portraitJpeg:Data(repeating:0,count:24001).base64EncodedString())] {
+            XCTAssertThrowsError(try invalid.validate())
+        }
+        var snapshot = WalletSnapshot(credentialId:ident,state:.revoked,createdAt:1,expiresAt:2000,requests:[],events:[],environment:"PRIVATE_PILOT",legalIdentityIssued:false)
+        snapshot.identity = identity
+        XCTAssertThrowsError(try snapshot.validate(for:ident))
+    }
+    func testPassportNumberDecodesWithoutChangingLegacyProfiles() throws {
+        let image = Data([0xff,0xd8,0xff,0xd9]).base64EncodedString()
+        var payload: [String: Any] = ["displayName":"ALICE SYNTHETIC", "birthDateMrz":"570413", "portraitJpeg":image]
+        func decode() throws -> PassportIdentity {
+            try JSONDecoder().decode(PassportIdentity.self, from: JSONSerialization.data(withJSONObject: payload))
+        }
+        XCTAssertNil(try decode().passportPersonalNumber)
+        payload["passportPersonalNumber"] = NSNull()
+        XCTAssertNil(try decode().passportPersonalNumber)
+        for number in ["195704133106", "5704133106"] {
+            payload["passportPersonalNumber"] = number
+            let value = try decode()
+            XCTAssertEqual(value.passportPersonalNumber, number)
+            XCTAssertNoThrow(try value.validate())
+        }
+        for number in ["19570413-3106", "570413310", "195704133106\n", "ABCDEFGHIJKL"] {
+            payload["passportPersonalNumber"] = number
+            XCTAssertThrowsError(try decode().validate())
+        }
+        payload["passportPersonalNumber"] = 123
+        XCTAssertThrowsError(try decode())
+    }
+    func testMalformedPayloadAndVersionCannotBeSigned() {
+        for raw in ["!", Data("{}".utf8).base64EncodedString(), Data(repeating: 0, count: 5000).base64EncodedString()] {
+            XCTAssertThrowsError(try DeviceChallenge(id:"challenge",signingInput:raw).validatedBytes(configuration:config,credentialID:ident,action:"approve",request:request,now:now))
+        }
+        XCTAssertThrowsError(try envelope(["version":2]).validatedBytes(configuration:config,credentialID:ident,action:"approve",request:request,now:now))
+    }
+    func testAutomaticBetaConnectionAndExistingServerBinding() throws {
+        let beta = ServerConfiguration.initial(saved: nil)
+        XCTAssertEqual(beta.origin, "https://api.openid.tensetti.io")
+        XCTAssertTrue(beta.pairing.isEmpty)
+        XCTAssertTrue(beta.isPublicBeta)
+        XCTAssertEqual(ServerConfiguration.initial(saved: config), config)
+        for origin in ["https://evil.invalid", "http://api.openid.tensetti.io", "https://api.openid.tensetti.io.evil.invalid", "https://10.77.0.1:8765"] {
+            XCTAssertThrowsError(try ServerConfiguration(origin: origin, pairing: ""))
+        }
+    }
+    func testHTTPSOriginNormalization() throws {
+        XCTAssertEqual(try ServerConfiguration(origin: "https://example.test/", pairing: config.pairing).origin, "https://example.test")
+    }
+    func testUnsafeServerAddressesAreRejected() {
+        for address in ["http://example.test", "https://user:password@example.test", "https://example.test/path", "https://example.test?token=abc", "https://example.test#fragment", "https://example.test:0", "file:///etc/passwd", "https://example.test/%2f"] {
+            XCTAssertThrowsError(try ServerConfiguration(origin: address, pairing: config.pairing), address)
+        }
+    }
+    func testInvalidPairingCodesAreRejected() {
+        for code in ["", "short", String(repeating:"x", count:129), String(repeating:"x", count:40)+"\n"] {
+            XCTAssertThrowsError(try ServerConfiguration(origin:config.origin,pairing:code))
+        }
+    }
+    func testOnlyOpaqueSameAppRequestLinksAreAccepted() {
+        XCTAssertEqual(RequestLink.identifier(URL(string:"openid://request/"+requestID)!),requestID)
+        for value in ["https://evil.test/"+requestID,"openid://user@request/"+requestID,"openid://request/"+requestID+"?callback=https://evil.test","openid://request/short","openid://request:123/"+requestID,"openid://request/"+requestID+"#fragment"] {
+            XCTAssertNil(RequestLink.identifier(URL(string:value)!))
+        }
+    }
+    func testSnapshotFromOtherCredentialOrEnvironmentRejected() {
+        let empty = WalletSnapshot(credentialId:"other",state:.active,createdAt:1,expiresAt:2000,requests:[],events:[],environment:"PRIVATE_PILOT",legalIdentityIssued:false)
+        XCTAssertThrowsError(try empty.validate(for:ident))
+        let production = WalletSnapshot(credentialId:ident,state:.active,createdAt:1,expiresAt:2000,requests:[],events:[],environment:"PRODUCTION",legalIdentityIssued:true)
+        XCTAssertThrowsError(try production.validate(for:ident))
+    }
+    func testRevokedSnapshotMustNotOfferApproval() {
+        let revoked = WalletSnapshot(credentialId:ident,state:.revoked,createdAt:1,expiresAt:2000,requests:[request],events:[],environment:"PRIVATE_PILOT",legalIdentityIssued:false)
+        XCTAssertThrowsError(try revoked.validate(for:ident))
+    }
+    func testRevocationProofIsBoundToCredentialAndPublicBeta() throws {
+        let code = ident + "." + String(repeating: "x", count: 43)
+        try RevocationProof(origin: ServerConfiguration.betaOrigin, code: code).validate(for: ident)
+        XCTAssertThrowsError(try RevocationProof(origin: "https://other.invalid", code: code).validate(for: ident))
+        XCTAssertThrowsError(try RevocationProof(origin: ServerConfiguration.betaOrigin, code: code).validate(for: String(repeating: "b", count: 64)))
+        for invalid in [code + "?redirect=evil", code + "\n", String(code.dropLast()), "short"] {
+            XCTAssertThrowsError(try RevocationProof(origin: ServerConfiguration.betaOrigin, code: invalid).validate(for: ident))
+        }
+    }
+    func testRevocationProofIsNotPutInEndpointURL() {
+        XCTAssertEqual(RevocationProof.endpoint.scheme, "https")
+        XCTAssertNil(RevocationProof.endpoint.query)
+        XCTAssertNil(RevocationProof.endpoint.fragment)
+    }
+    @MainActor func testRevocationMayInterruptStatusButNeverAnUnconfirmedDecision() {
+        XCTAssertTrue(WalletModel.canInterruptForRevocation("snapshot"))
+        XCTAssertTrue(WalletModel.canInterruptForRevocation("inspect"))
+        for action in [nil, "approve", "reject", "revoke", "enroll", "unknown"] as [String?] {
+            XCTAssertFalse(WalletModel.canInterruptForRevocation(action))
+        }
+        XCTAssertFalse(WalletModel().canRevoke)
+    }
+}
